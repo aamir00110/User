@@ -3,3 +3,25 @@ is
 begin
   return upper(coalesce(sys_context('APEX$SESSION','APP_USER'), sys_context('USERENV','SESSION_USER')));
 end current_user;
+
+  CREATE OR REPLACE EDITIONABLE TRIGGER "MS_COMPLAINT_H_BIUD" 
+before insert or update or delete on "MS_COMPLAINT_H" for each row
+declare
+  l_user varchar2(255) := ms_current_user;
+  l_id   varchar2(100);
+  l_act  varchar2(10);
+begin
+  if inserting then
+    :new.created_by := l_user; :new.created_date := sysdate;
+    :new.updated_by := l_user; :new.updated_date := sysdate;
+    l_act := 'INSERT'; l_id := to_char(:new.COMPLAINT_ID);
+  elsif updating then
+    :new.created_by := :old.created_by; :new.created_date := :old.created_date;
+    :new.updated_by := l_user; :new.updated_date := sysdate;
+    l_act := 'UPDATE'; l_id := to_char(:new.COMPLAINT_ID);
+  else
+    l_act := 'DELETE'; l_id := to_char(:old.COMPLAINT_ID);
+  end if;
+  insert into ms_audit_log (table_name, record_id, action_type, action_by, action_date)
+  values ('MMS_COMPLAINT_H', l_id, l_act, l_user, sysdate);
+end;
