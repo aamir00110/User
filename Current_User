@@ -1,0 +1,5 @@
+create or replace function current_user return varchar2
+is
+begin
+  return upper(coalesce(sys_context('APEX$SESSION','APP_USER'), sys_context('USERENV','SESSION_USER')));
+end current_user;
