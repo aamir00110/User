@@ -1,0 +1,495 @@
+create or replace PACKAGE PKG_ATTENDANCE AS
+
+    -- Constants
+    FACE_MATCH_THRESHOLD CONSTANT NUMBER := 85;
+    LATE_GRACE_MINUTES CONSTANT NUMBER := 15;
+
+    -- Procedures
+    PROCEDURE RECORD_ATTENDANCE (
+        p_employee_id       IN NUMBER,
+        p_face_image_path   IN VARCHAR2,
+        p_face_score        IN NUMBER,
+        p_attendance_date   IN DATE,
+        p_status            OUT VARCHAR2
+    );
+
+    PROCEDURE CHECK_IN (
+        p_employee_id       IN NUMBER,
+        p_face_image_path   IN VARCHAR2,
+        p_face_score        IN NUMBER,
+        p_check_in_status   OUT VARCHAR2
+    );
+
+    PROCEDURE CHECK_OUT (
+        p_employee_id       IN NUMBER,
+        p_face_image_path   IN VARCHAR2,
+        p_check_out_status  OUT VARCHAR2
+    );
+
+    PROCEDURE MARK_ABSENT (
+        p_employee_id       IN NUMBER,
+        p_attendance_date   IN DATE,
+        p_reason            IN VARCHAR2
+    );
+
+    PROCEDURE REQUEST_LEAVE (
+        p_employee_id       IN NUMBER,
+        p_leave_type        IN VARCHAR2,
+        p_start_date        IN DATE,
+        p_end_date          IN DATE,
+        p_reason            IN VARCHAR2,
+        p_leave_id          OUT NUMBER
+    );
+
+    PROCEDURE APPROVE_LEAVE (
+        p_leave_id          IN NUMBER,
+        p_approved_by       IN NUMBER,
+        p_status            IN VARCHAR2
+    );
+
+    FUNCTION GET_ATTENDANCE_STATUS (
+        p_employee_id       IN NUMBER,
+        p_date              IN DATE
+    ) RETURN VARCHAR2;
+
+    FUNCTION GET_EMPLOYEE_ATTENDANCE_REPORT (
+        p_employee_id       IN NUMBER,
+        p_month             IN NUMBER,
+        p_year              IN NUMBER
+    ) RETURN SYS_REFCURSOR;
+
+    FUNCTION IS_EMPLOYEE_ON_LEAVE (
+        p_employee_id       IN NUMBER,
+        p_check_date        IN DATE
+    ) RETURN VARCHAR2;
+
+    PROCEDURE LOG_FACE_RECOGNITION (
+        p_employee_id       IN NUMBER,
+        p_match_score       IN NUMBER,
+        p_status            IN VARCHAR2,
+        p_image_path        IN VARCHAR2,
+        p_error_msg         IN VARCHAR2 DEFAULT NULL,
+        p_api_response      IN CLOB DEFAULT NULL
+    );
+
+    PROCEDURE GENERATE_DAILY_REPORT (
+        p_report_date       IN DATE,
+        p_generated_by      IN NUMBER,
+        p_report_id         OUT NUMBER
+    );
+
+END PKG_ATTENDANCE;
+/
+
+create or replace PACKAGE BODY PKG_ATTENDANCE AS
+
+    -- =====================================================
+    -- RECORD_ATTENDANCE - Main Attendance Recording
+    -- =====================================================
+    PROCEDURE RECORD_ATTENDANCE (
+        p_employee_id       IN NUMBER,
+        p_face_image_path   IN VARCHAR2,
+        p_face_score        IN NUMBER,
+        p_attendance_date   IN DATE,
+        p_status            OUT VARCHAR2
+    ) AS
+        v_attendance_id     NUMBER;
+        v_check_in_time     TIMESTAMP;
+        v_check_out_time    TIMESTAMP;
+        v_current_time      TIMESTAMP := SYSTIMESTAMP;
+        v_leave_status      VARCHAR2(20);
+        v_attendance_status VARCHAR2(20);
+    BEGIN
+        -- Check if employee is on leave
+        v_leave_status := IS_EMPLOYEE_ON_LEAVE(p_employee_id, p_attendance_date);
+
+        IF v_leave_status = 'YES' THEN
+            p_status := 'ON_LEAVE';
+            RETURN;
+        END IF;
+
+        -- Verify face match score
+        IF p_face_score < FACE_MATCH_THRESHOLD THEN
+            LOG_FACE_RECOGNITION(
+                p_employee_id,
+                p_face_score,
+                'LOW_CONFIDENCE',
+                p_face_image_path,
+                'Face match score below threshold: ' || p_face_score
+            );
+            p_status := 'FACE_MATCH_FAILED';
+            RETURN;
+        END IF;
+
+        -- Check if already checked in today
+        SELECT COUNT(*) INTO v_attendance_id
+        FROM ATTENDANCE
+        WHERE EMPLOYEE_ID = p_employee_id
+        AND TRUNC(ATTENDANCE_DATE) = TRUNC(p_attendance_date)
+        AND CHECK_IN_TIME IS NOT NULL;
+
+        IF v_attendance_id > 0 THEN
+            -- Already checked in, this is check-out
+            UPDATE ATTENDANCE
+            SET CHECK_OUT_TIME = v_current_time
+            WHERE EMPLOYEE_ID = p_employee_id
+            AND TRUNC(ATTENDANCE_DATE) = TRUNC(p_attendance_date)
+            AND CHECK_OUT_TIME IS NULL;
+            
+            LOG_FACE_RECOGNITION(
+                p_employee_id,
+                p_face_score,
+                'SUCCESS',
+                p_face_image_path
+            );
+            p_status := 'CHECK_OUT_SUCCESS';
+        ELSE
+            -- New attendance record
+            SELECT SEQ_ATTENDANCE_ID.NEXTVAL INTO v_attendance_id FROM DUAL;
+
+            INSERT INTO ATTENDANCE (
+                ATTENDANCE_ID,
+                EMPLOYEE_ID,
+                ATTENDANCE_DATE,
+                CHECK_IN_TIME,
+                FACE_MATCH_SCORE,
+                FACE_IMAGE_PATH,
+                STATUS,
+                CREATED_DATE
+            ) VALUES (
+                v_attendance_id,
+                p_employee_id,
+                p_attendance_date,
+                v_current_time,
+                p_face_score,
+                p_face_image_path,
+                'PRESENT',
+                SYSDATE
+            );
+
+            LOG_FACE_RECOGNITION(
+                p_employee_id,
+                p_face_score,
+                'SUCCESS',
+                p_face_image_path
+            );
+            p_status := 'CHECK_IN_SUCCESS';
+        END IF;
+
+        COMMIT;
+
+    EXCEPTION WHEN OTHERS THEN
+        LOG_FACE_RECOGNITION(
+            p_employee_id,
+            p_face_score,
+            'FAILED',
+            p_face_image_path,
+            SQLERRM
+        );
+        p_status := 'ERROR: ' || SQLERRM;
+        ROLLBACK;
+    END RECORD_ATTENDANCE;
+
+    -- =====================================================
+    -- CHECK_IN - Employee Check In
+    -- =====================================================
+    PROCEDURE CHECK_IN (
+        p_employee_id       IN NUMBER,
+        p_face_image_path   IN VARCHAR2,
+        p_face_score        IN NUMBER,
+        p_check_in_status   OUT VARCHAR2
+    ) AS
+    BEGIN
+        RECORD_ATTENDANCE(
+            p_employee_id,
+            p_face_image_path,
+            p_face_score,
+            TRUNC(SYSDATE),
+            p_check_in_status
+        );
+    END CHECK_IN;
+
+    -- =====================================================
+    -- CHECK_OUT - Employee Check Out
+    -- =====================================================
+    PROCEDURE CHECK_OUT (
+        p_employee_id       IN NUMBER,
+        p_face_image_path   IN VARCHAR2,
+        p_check_out_status  OUT VARCHAR2
+    ) AS
+    BEGIN
+        UPDATE ATTENDANCE
+        SET CHECK_OUT_TIME = SYSTIMESTAMP
+        WHERE EMPLOYEE_ID = p_employee_id
+        AND TRUNC(ATTENDANCE_DATE) = TRUNC(SYSDATE)
+        AND CHECK_OUT_TIME IS NULL;
+
+        LOG_FACE_RECOGNITION(
+            p_employee_id,
+            100,
+            'SUCCESS',
+            p_face_image_path
+        );
+
+        p_check_out_status := 'CHECK_OUT_SUCCESS';
+        COMMIT;
+
+    EXCEPTION WHEN OTHERS THEN
+        p_check_out_status := 'ERROR: ' || SQLERRM;
+        ROLLBACK;
+    END CHECK_OUT;
+
+    -- =====================================================
+    -- MARK_ABSENT - Manual Absence Marking
+    -- =====================================================
+    PROCEDURE MARK_ABSENT (
+        p_employee_id       IN NUMBER,
+        p_attendance_date   IN DATE,
+        p_reason            IN VARCHAR2
+    ) AS
+        v_attendance_id NUMBER;
+    BEGIN
+        SELECT SEQ_ATTENDANCE_ID.NEXTVAL INTO v_attendance_id FROM DUAL;
+
+        INSERT INTO ATTENDANCE (
+            ATTENDANCE_ID,
+            EMPLOYEE_ID,
+            ATTENDANCE_DATE,
+            STATUS,
+            REMARKS,
+            CREATED_DATE
+        ) VALUES (
+            v_attendance_id,
+            p_employee_id,
+            p_attendance_date,
+            'ABSENT',
+            p_reason,
+            SYSDATE
+        );
+
+        COMMIT;
+    END MARK_ABSENT;
+
+    -- =====================================================
+    -- REQUEST_LEAVE - Employee Request Leave
+    -- =====================================================
+    PROCEDURE REQUEST_LEAVE (
+        p_employee_id       IN NUMBER,
+        p_leave_type        IN VARCHAR2,
+        p_start_date        IN DATE,
+        p_end_date          IN DATE,
+        p_reason            IN VARCHAR2,
+        p_leave_id          OUT NUMBER
+    ) AS
+    BEGIN
+        SELECT SEQ_LEAVE_ID.NEXTVAL INTO p_leave_id FROM DUAL;
+
+        INSERT INTO LEAVES (
+            LEAVE_ID,
+            EMPLOYEE_ID,
+            LEAVE_TYPE,
+            START_DATE,
+            END_DATE,
+            REASON,
+            STATUS,
+            CREATED_DATE
+        ) VALUES (
+            p_leave_id,
+            p_employee_id,
+            p_leave_type,
+            p_start_date,
+            p_end_date,
+            p_reason,
+            'PENDING',
+            SYSDATE
+        );
+
+        COMMIT;
+    END REQUEST_LEAVE;
+
+    -- =====================================================
+    -- APPROVE_LEAVE - Manager Approve/Reject Leave
+    -- =====================================================
+    PROCEDURE APPROVE_LEAVE (
+        p_leave_id          IN NUMBER,
+        p_approved_by       IN NUMBER,
+        p_status            IN VARCHAR2
+    ) AS
+    BEGIN
+        UPDATE LEAVES
+        SET STATUS = p_status,
+            APPROVED_BY = p_approved_by,
+            APPROVAL_DATE = SYSDATE
+        WHERE LEAVE_ID = p_leave_id;
+
+        COMMIT;
+    END APPROVE_LEAVE;
+
+    -- =====================================================
+    -- GET_ATTENDANCE_STATUS - Get Status for a Date
+    -- =====================================================
+    FUNCTION GET_ATTENDANCE_STATUS (
+        p_employee_id       IN NUMBER,
+        p_date              IN DATE
+    ) RETURN VARCHAR2 AS
+        v_status VARCHAR2(20);
+    BEGIN
+        SELECT STATUS INTO v_status
+        FROM ATTENDANCE
+        WHERE EMPLOYEE_ID = p_employee_id
+        AND TRUNC(ATTENDANCE_DATE) = TRUNC(p_date);
+
+        RETURN v_status;
+
+    EXCEPTION WHEN NO_DATA_FOUND THEN
+        RETURN 'NOT_MARKED';
+    END GET_ATTENDANCE_STATUS;
+
+    -- =====================================================
+    -- IS_EMPLOYEE_ON_LEAVE - Check Leave Status
+    -- =====================================================
+    FUNCTION IS_EMPLOYEE_ON_LEAVE (
+        p_employee_id       IN NUMBER,
+        p_check_date        IN DATE
+    ) RETURN VARCHAR2 AS
+        v_count NUMBER;
+    BEGIN
+        SELECT COUNT(*) INTO v_count
+        FROM LEAVES
+        WHERE EMPLOYEE_ID = p_employee_id
+        AND p_check_date BETWEEN START_DATE AND END_DATE
+        AND STATUS = 'APPROVED';
+
+        IF v_count > 0 THEN
+            RETURN 'YES';
+        ELSE
+            RETURN 'NO';
+        END IF;
+    END IS_EMPLOYEE_ON_LEAVE;
+
+    -- =====================================================
+    -- LOG_FACE_RECOGNITION - Log Face Recognition Attempts
+    -- =====================================================
+    PROCEDURE LOG_FACE_RECOGNITION (
+        p_employee_id       IN NUMBER,
+        p_match_score       IN NUMBER,
+        p_status            IN VARCHAR2,
+        p_image_path        IN VARCHAR2,
+        p_error_msg         IN VARCHAR2 DEFAULT NULL,
+        p_api_response      IN CLOB DEFAULT NULL
+    ) AS
+        v_log_id NUMBER;
+    BEGIN
+        SELECT SEQ_LOG_ID.NEXTVAL INTO v_log_id FROM DUAL;
+
+        INSERT INTO FACE_RECOGNITION_LOG (
+            LOG_ID,
+            EMPLOYEE_ID,
+            ATTEMPT_TIME,
+            MATCH_SCORE,
+            MATCH_STATUS,
+            IMAGE_PATH,
+            ERROR_MESSAGE,
+            API_RESPONSE,
+            CREATED_DATE
+        ) VALUES (
+            v_log_id,
+            p_employee_id,
+            SYSTIMESTAMP,
+            p_match_score,
+            p_status,
+            p_image_path,
+            p_error_msg,
+            p_api_response,
+            SYSDATE
+        );
+
+        COMMIT;
+    END LOG_FACE_RECOGNITION;
+
+    -- =====================================================
+    -- GET_EMPLOYEE_ATTENDANCE_REPORT - Monthly Report
+    -- =====================================================
+    FUNCTION GET_EMPLOYEE_ATTENDANCE_REPORT (
+        p_employee_id       IN NUMBER,
+        p_month             IN NUMBER,
+        p_year              IN NUMBER
+    ) RETURN SYS_REFCURSOR AS
+        v_cursor SYS_REFCURSOR;
+    BEGIN
+        OPEN v_cursor FOR
+        SELECT 
+            A.ATTENDANCE_DATE,
+            E.EMPLOYEE_CODE,
+            E.FIRST_NAME || ' ' || E.LAST_NAME AS EMPLOYEE_NAME,
+            TO_CHAR(A.CHECK_IN_TIME, 'HH24:MI:SS') AS CHECK_IN,
+            TO_CHAR(A.CHECK_OUT_TIME, 'HH24:MI:SS') AS CHECK_OUT,
+            A.STATUS,
+            A.FACE_MATCH_SCORE
+        FROM ATTENDANCE A
+        JOIN EMPLOYEES E ON A.EMPLOYEE_ID = E.EMPLOYEE_ID
+        WHERE A.EMPLOYEE_ID = p_employee_id
+        AND EXTRACT(MONTH FROM A.ATTENDANCE_DATE) = p_month
+        AND EXTRACT(YEAR FROM A.ATTENDANCE_DATE) = p_year
+        ORDER BY A.ATTENDANCE_DATE;
+
+        RETURN v_cursor;
+    END GET_EMPLOYEE_ATTENDANCE_REPORT;
+
+    -- =====================================================
+    -- GENERATE_DAILY_REPORT - Generate Daily Attendance Report
+    -- =====================================================
+    PROCEDURE GENERATE_DAILY_REPORT (
+        p_report_date       IN DATE,
+        p_generated_by      IN NUMBER,
+        p_report_id         OUT NUMBER
+    ) AS
+        v_report_data CLOB;
+    BEGIN
+        SELECT SEQ_REPORT_ID.NEXTVAL INTO p_report_id FROM DUAL;
+
+        -- Generate report data
+        SELECT XMLTYPE(
+            '<?xml version="1.0"?><report><data>' ||
+            LISTAGG(
+                '<record>' ||
+                '<employee_id>' || EMPLOYEE_ID || '</employee_id>' ||
+                '<employee_code>' || EMPLOYEE_CODE || '</employee_code>' ||
+                '<status>' || STATUS || '</status>' ||
+                '</record>',
+                ''
+            ) || '</data></report>'
+        ).GETCLOBVAL() INTO v_report_data
+        FROM (
+            SELECT 
+                A.EMPLOYEE_ID,
+                E.EMPLOYEE_CODE,
+                A.STATUS
+            FROM ATTENDANCE A
+            JOIN EMPLOYEES E ON A.EMPLOYEE_ID = E.EMPLOYEE_ID
+            WHERE TRUNC(A.ATTENDANCE_DATE) = TRUNC(p_report_date)
+        );
+
+        INSERT INTO ATTENDANCE_REPORTS (
+            REPORT_ID,
+            REPORT_NAME,
+            REPORT_TYPE,
+            GENERATED_BY,
+            GENERATED_DATE,
+            REPORT_DATA,
+            STATUS
+        ) VALUES (
+            p_report_id,
+            'Daily Report - ' || TO_CHAR(p_report_date, 'YYYY-MM-DD'),
+            'DAILY',
+            p_generated_by,
+            SYSDATE,
+            v_report_data,
+            'COMPLETED'
+        );
+
+        COMMIT;
+    END GENERATE_DAILY_REPORT;
+
+END PKG_ATTENDANCE;
+/
